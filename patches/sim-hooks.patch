@@ -1,0 +1,221 @@
+diff -ru nim-sds-master/sds/protobuf.nim nim-sds/sds/protobuf.nim
+--- nim-sds-master/sds/protobuf.nim	2026-10-29 11:41:29.000000000 +0300
++++ nim-sds/sds/protobuf.nim	2026-11-04 13:18:26.563682252 +0300
+@@ -149,7 +149,30 @@
+   except CatchableError:
+     return err(ReliabilityError.reSerializationError)
+ 
+-proc deserializeMessage*(data: seq[byte]): Result[SdsMessage, ReliabilityError] =
++proc deserializeMessageImpl(data: seq[byte]): Result[SdsMessage, ReliabilityError] {.gcsafe.}
++
++# --- SIM PATCH (not upstream): memoize the last decode. unwrapReceivedMessage
++# decodes the same bytes twice (extractChannelId, then deserializeMessage);
++# decoding is a pure function, so caching the last input changes no behaviour.
++var sdsSimDecodeCache*: bool = false
++var lastDecodeIn {.threadvar.}: seq[byte]
++var lastDecodeOut {.threadvar.}: Result[SdsMessage, ReliabilityError]
++var lastDecodeValid {.threadvar.}: bool
++
++proc deserializeMessage*(data: seq[byte]): Result[SdsMessage, ReliabilityError] {.gcsafe.} =
++  {.cast(gcsafe).}:
++    if sdsSimDecodeCache:
++      if lastDecodeValid and data == lastDecodeIn:
++        return lastDecodeOut
++      let r = deserializeMessageImpl(data)
++      lastDecodeIn = data
++      lastDecodeOut = r
++      lastDecodeValid = true
++      return r
++  deserializeMessageImpl(data)
++# --- end SIM PATCH ---
++
++proc deserializeMessageImpl(data: seq[byte]): Result[SdsMessage, ReliabilityError] {.gcsafe.} =
+   ## proto3 has no required fields, so the mandatory identifiers are validated
+   ## by hand after decoding. `content`/`bloomFilter`/`lamportTimestamp` may
+   ## legitimately be empty/zero (e.g. periodic sync messages).
+@@ -169,6 +192,10 @@
+ 
+ proc extractChannelId*(data: seq[byte]): Result[SdsChannelID, ReliabilityError] =
+   ## Channel ID without retaining the rest of the decoded message.
++  {.cast(gcsafe).}:
++    if sdsSimDecodeCache:  # SIM PATCH: reuse the memoized full decode
++      let r = deserializeMessage(data)
++      if r.isOk: return ok(r.get().channelId)
+   try:
+     return ok(Protobuf.decode(data, SdsMessagePB).channelId.valueOr(@[]).toStr)
+   except CatchableError:
+diff -ru nim-sds-master/sds/sds.nim nim-sds/sds/sds.nim
+--- nim-sds-master/sds/sds.nim	2026-10-29 11:41:29.000000000 +0300
++++ nim-sds/sds/sds.nim	2026-11-04 13:50:04.276300370 +0300
+@@ -4,6 +4,18 @@
+ 
+ export types, protobuf, sds_utils, rolling_bloom_filter
+ 
++# --- SIM PATCH (not upstream): injectable virtual clock ---
++# When sdsSimTimeMs >= 0, protocol-time reads return that virtual time.
++# With the default -1, behaviour is identical to upstream (wall clock).
++var sdsSimTimeMs*: int64 = -1
++
++proc sdsGetTime*(): Time =
++  {.cast(gcsafe).}:
++    if sdsSimTimeMs >= 0:
++      return initTime(sdsSimTimeMs div 1000, (sdsSimTimeMs mod 1000) * 1_000_000)
++  getTime()
++# --- end SIM PATCH ---
++
+ proc newReliabilityManager*(
+     participantId: SdsParticipantID,
+     config: ReliabilityConfig = defaultConfig(),
+@@ -102,7 +114,7 @@
+       try:
+         let channel = (await rm.getOrCreateChannel(channelId)).valueOr:
+           return err(error)
+-        (await rm.updateLamportTimestamp(getTime().toUnix, channelId)).isOkOr:
++        (await rm.updateLamportTimestamp(sdsGetTime().toUnix, channelId)).isOkOr:
+           return err(error)
+ 
+         let bfResult = serializeBloomFilter(channel.bloomFilter.filter)
+@@ -115,7 +127,7 @@
+         # the smallest minTimeRepairReq — they are the most overdue and the
+         # ones the network most needs us to ask about.
+         var repairReqs: seq[HistoryEntry] = @[]
+-        let now = getTime()
++        let now = sdsGetTime()
+         var expiredKeys: seq[SdsMessageID] = @[]
+         var eligible: seq[(SdsMessageID, OutgoingRepairEntry)] = @[]
+         for msgId, repairEntry in channel.outgoingRepairBuffer:
+@@ -147,7 +159,7 @@
+         )
+ 
+         let unackMsg = UnacknowledgedMessage.init(
+-          message = msg, sendTime = getTime(), resendAttempts = 0
++          message = msg, sendTime = sdsGetTime(), resendAttempts = 0
+         )
+         channel.outgoingBuffer.add(unackMsg)
+         # Phase 2B: in-memory append only; op-end trySaveMeta covers it.
+@@ -200,7 +212,9 @@
+       var processed = initHashSet[SdsMessageID]()
+       var readyToProcess = newSeq[SdsMessageID]()
+ 
+-      for msgId, entry in channel.incomingBuffer:
++      # SIM PATCH 4 (perf, semantics-preserving): iterate by reference (mpairs)
++      # instead of copying every buffered IncomingMessage incl. causal history.
++      for msgId, entry in channel.incomingBuffer.mpairs:
+         if entry.missingDeps.len == 0:
+           readyToProcess.add(msgId)
+ 
+@@ -217,14 +231,14 @@
+               rm.onMessageReady(msgId, channelId)
+           processed.incl(msgId)
+ 
+-          for remainingId, entry in channel.incomingBuffer:
++          for remainingId, entry in channel.incomingBuffer.mpairs:
+             if remainingId notin processed:
+               if msgId in entry.missingDeps:
+                 # Phase 2B: in-memory dep-set shrink only; the parent op
+                 # (unwrap / markDeps) issues a single trySaveMeta at its
+                 # end that captures the final incomingBuffer state.
+-                channel.incomingBuffer[remainingId].missingDeps.excl(msgId)
+-                if channel.incomingBuffer[remainingId].missingDeps.len == 0:
++                entry.missingDeps.excl(msgId)
++                if entry.missingDeps.len == 0:
+                   readyToProcess.add(remainingId)
+ 
+       for msgId in processed:
+@@ -283,7 +297,7 @@
+     # answer for messages we have actually delivered (i.e. that live in
+     # messageHistory) — buffered-but-undelivered messages are not in a state
+     # to confidently rebroadcast.
+-    let now = getTime()
++    let now = sdsGetTime()
+     for repairEntry in msg.repairRequest:
+       # Remove from our own outgoing repair buffer (someone else is also requesting).
+       # Phase 2B: in-memory delete only; op-end trySaveMeta covers it.
+@@ -313,8 +327,9 @@
+ 
+     if missingDeps.len == 0:
+       var depsInBuffer = false
+-      for msgId, entry in channel.incomingBuffer.pairs():
+-        if msgId in msg.causalHistory.getMessageIds():
++      let histIds = msg.causalHistory.getMessageIds().toHashSet()  # SIM PATCH 4
++      for msgId in channel.incomingBuffer.keys:
++        if msgId in histIds:
+           depsInBuffer = true
+           break
+       if depsInBuffer:
+@@ -326,9 +341,9 @@
+         (await rm.addToHistory(msg, channelId)).isOkOr:
+           return err(error)
+         # Unblock any buffered messages that were waiting on this one.
+-        for pendingId, entry in channel.incomingBuffer:
++        for pendingId, entry in channel.incomingBuffer.mpairs:  # SIM PATCH 4
+           if msg.messageId in entry.missingDeps:
+-            channel.incomingBuffer[pendingId].missingDeps.excl(msg.messageId)
++            entry.missingDeps.excl(msg.messageId)
+         # Cascade — addToHistory calls within processIncomingBuffer queue
+         # their entries on the channel's pending-history queue, flushed
+         # by the single op-end tryUpdateHistory below.
+@@ -387,9 +402,9 @@
+ 
+       # Phase 2B: in-memory dep-set shrink + repair-buffer dels only; the
+       # op-end trySaveMeta below covers all mutations atomically.
+-      for pendingId, entry in channel.incomingBuffer:
++      for pendingId, entry in channel.incomingBuffer.mpairs:  # SIM PATCH 4
+         if msgId in entry.missingDeps:
+-          channel.incomingBuffer[pendingId].missingDeps.excl(msgId)
++          entry.missingDeps.excl(msgId)
+ 
+       # SDS-R: clear from repair buffers (dependency now met).
+       channel.outgoingRepairBuffer.del(msgId)
+@@ -451,7 +466,7 @@
+         return ok()
+ 
+       let channel = rm.channels[channelId]
+-      let now = getTime()
++      let now = sdsGetTime()
+       var newOutgoingBuffer: seq[UnacknowledgedMessage] = @[]
+       var dirty = false
+ 
+@@ -525,7 +540,7 @@
+   try:
+     await rm.lock.acquire()
+     try:
+-      let now = getTime()
++      let now = sdsGetTime()
+       for channelId, channel in rm.channels:
+         var dirty = false
+         try:
+diff -ru nim-sds-master/sds/sds_utils.nim nim-sds/sds/sds_utils.nim
+--- nim-sds-master/sds/sds_utils.nim	2026-10-29 11:41:29.000000000 +0300
++++ nim-sds/sds/sds_utils.nim	2026-11-04 13:18:26.583563109 +0300
+@@ -36,9 +36,18 @@
+     meta.incomingRepairBuffer.add(IncomingRepairKV(messageId: id, entry: e))
+   return meta
+ 
++# --- SIM PATCH (not upstream): skip persistence work when the backend is a
++# no-op. Saves building ChannelMeta / HistoryUpdate copies on every op; the
++# no-op backend discards them anyway, so protocol behaviour is unchanged.
++var sdsSimSkipPersistence*: bool = false
++# --- end SIM PATCH ---
++
+ proc trySaveMeta*(
+     rm: ReliabilityManager, channelId: SdsChannelID, channel: ChannelContext
+ ) {.async: (raises: []).} =
++  {.cast(gcsafe).}:
++    if sdsSimSkipPersistence:
++      return
+   ## Best-effort meta snapshot save. Per PLAN §8 the protocol op does NOT
+   ## abort on persistence failure — in-memory state is the source of truth
+   ## and the next op's snapshot will re-synchronise on-disk state.
+@@ -106,6 +115,11 @@
+ 
+   if channel.pendingHistoryAppends.len == 0 and channel.pendingHistoryEvicts.len == 0:
+     return # nothing to flush — no round-trip cost
++  {.cast(gcsafe).}:
++    if sdsSimSkipPersistence:  # SIM PATCH: no-op backend, just drop the queue
++      channel.pendingHistoryAppends.clear()
++      channel.pendingHistoryEvicts.clear()
++      return
+ 
+   var batch = HistoryUpdate.init()
+   # Look up each queued id in messageHistory (source of truth). The

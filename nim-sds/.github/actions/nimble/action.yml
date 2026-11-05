@@ -1,0 +1,37 @@
+name: 'Set up Nimble'
+description: 'Install the pinned Nimble, then resolve the locked dependencies.'
+
+inputs:
+  repo-token:
+    description: 'GITHUB_TOKEN, used to avoid API rate limits while resolving the Nimble release.'
+    required: false
+    default: ''
+
+runs:
+  using: 'composite'
+  steps:
+    # The Nimble bundled with Nim resolves installDirs against srcDir, so a
+    # dependent that installs this package gets no library/.
+    - uses: nim-lang/setup-nimble-action@v2
+      with:
+        nimble-version: '0.26.0'
+        repo-token: ${{ inputs.repo-token }}
+
+    - name: Enable Git long paths
+      if: runner.os == 'Windows'
+      shell: bash
+      run: git config --global core.longpaths true
+
+    # Nim's runtime does not use the \\?\ extended-path prefix, so a deep
+    # dependency under the default TEMP still exceeds 260 chars.
+    - name: Shorten the temporary directory
+      if: runner.os == 'Windows'
+      shell: pwsh
+      run: |
+        New-Item -ItemType Directory -Force -Path C:\T | Out-Null
+        "TEMP=C:\T" >> $env:GITHUB_ENV
+        "TMP=C:\T"  >> $env:GITHUB_ENV
+
+    - name: Install dependencies
+      shell: bash
+      run: nimble setup -l

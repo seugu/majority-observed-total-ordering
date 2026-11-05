@@ -32,6 +32,40 @@ Per configuration the runner prints, counted over runs:
 
 It also prints latency, traffic, and any runs that deviated.
 
+```mermaid
+flowchart TD
+    REL["<b>1. Release</b><br/>a member publishes<br/>a MAIN (e.g. an<br/>MLS commit)"]
+    SDS["<b>2. Spread</b><br/>SDS gossips it over<br/>a lossy network and<br/>repairs lost copies"]
+    ADM["<b>3. Admit</b><br/>each member adds it<br/>to its log, in the<br/>order it arrives"]
+    SEEN["<b>4. Report</b><br/>it publishes a SEEN:<br/>its non-final mains,<br/>in its own order"]
+    COUNT["<b>5. Count</b><br/>every member tallies<br/>the reports for the<br/>next open position"]
+    Q{"same main named by<br/>at least N/2 + 1 members?"}
+    FIN["<b>6. Final</b><br/>position k is fixed,<br/>identical at every member"]
+    WAIT["wait for more reports"]
+    B["<b>Variant B</b><br/>every 20 s, re-send<br/>non-final mains and<br/>the latest report"]
+
+    REL --> SDS --> ADM --> SEEN --> COUNT --> Q
+    Q -- yes --> FIN
+    Q -- not yet --> WAIT --> COUNT
+    B -.-> SDS
+
+    classDef release fill:#dbeafe,stroke:#1d4ed8,stroke-width:2px,color:#0f172a
+    classDef net fill:#e5e7eb,stroke:#4b5563,stroke-width:2px,color:#111827
+    classDef host fill:#dcfce7,stroke:#15803d,stroke-width:2px,color:#052e16
+    classDef decide fill:#fef3c7,stroke:#b45309,stroke-width:2px,color:#451a03
+    classDef final fill:#166534,stroke:#052e16,stroke-width:2px,color:#ffffff
+    classDef opt fill:#ede9fe,stroke:#6d28d9,stroke-width:2px,stroke-dasharray:5 4,color:#2e1065
+    classDef muted fill:#f3f4f6,stroke:#9ca3af,stroke-width:1px,color:#374151
+
+    class REL release
+    class SDS net
+    class ADM,SEEN,COUNT host
+    class Q decide
+    class FIN final
+    class B opt
+    class WAIT muted
+```
+
 ## Arguments
 
 | Argument | Default | Meaning |
